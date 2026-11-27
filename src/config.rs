@@ -102,6 +102,10 @@ pub struct GeneralConfig {
     /// which case adding still works but that cleanup is switched off.
     #[serde(default)]
     pub watch_dir: Option<String>,
+    /// File-name glob patterns to remove from a torrent's payload after it
+    /// completes. Matching is case-insensitive; an empty list disables it.
+    #[serde(default)]
+    pub cleanup_patterns: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -452,6 +456,7 @@ impl Default for GeneralConfig {
             download_dir: default_download_dir(),
             confirm_on_quit: true,
             watch_dir: None,
+            cleanup_patterns: Vec::new(),
         }
     }
 }
@@ -1017,6 +1022,7 @@ confirm_on_quit = false
 download_dir = "/tmp/downloads"
 confirm_on_quit = false
 watch_dir = "/var/torrents/watch"
+cleanup_patterns = ["*downloaded*.txt", "*.nfo", "*.url"]
 
 [network]
 listen_port = 7000
@@ -1047,6 +1053,10 @@ max_results = 10
         assert_eq!(
             config.general.watch_dir.as_deref(),
             Some("/var/torrents/watch")
+        );
+        assert_eq!(
+            config.general.cleanup_patterns,
+            vec!["*downloaded*.txt", "*.nfo", "*.url"]
         );
         assert_eq!(config.network.listen_port, 7000);
         assert!(!config.network.enable_dht);
@@ -1151,6 +1161,7 @@ download_dir = "/tmp/downloads"
         let config: Config = toml::from_str(toml_str).unwrap();
         assert!(config.search.enable_apibay);
         assert!(config.search.enable_torrents_csv);
+        assert!(config.general.cleanup_patterns.is_empty());
         assert_eq!(config.search.timeout_secs, 8);
         assert_eq!(config.search.max_results, 50);
     }

@@ -295,6 +295,8 @@ pub struct TorrentEngine {
     /// The session's default output folder, to tell the subfolder librqbit
     /// picks for a previewed torrent apart from the folder it sits in.
     download_dir: PathBuf,
+    /// File-name glob patterns removed from completed torrent payloads.
+    cleanup_patterns: Vec<String>,
     /// Previews still resolving, keyed by the UI's ticket, so
     /// `CancelPreview` can stop one: its abort handle and its pending-add
     /// ticket. Each task removes its own entry when it ends, however it ends
@@ -598,6 +600,7 @@ impl TorrentEngine {
             pending_adds: std::sync::Mutex::new(HashMap::new()),
             next_pending_ticket: std::sync::atomic::AtomicU64::new(0),
             download_dir,
+            cleanup_patterns: config.general.cleanup_patterns.clone(),
             preview_tasks: std::sync::Mutex::new(HashMap::new()),
             failed_adds: std::sync::atomic::AtomicU64::new(0),
             mutation_lock: tokio::sync::Mutex::new(()),
@@ -1567,6 +1570,57 @@ impl TorrentEngine {
         })
     }
 
+    fn completion_cleanup_enabled(&self) -> bool {
+        !self.cleanup_patterns.is_empty()
+    }
+
+    /// IDs whose engine stats say the download is complete, including torrents
+    /// that are paused after reaching 100%.
+    fn finished_torrent_ids(&self) -> HashSet<usize> {
+        self.session.with_torrents(|iter| {
+            iter.filter_map(|(id, handle)| handle.stats().finished.then_some(id))
+                .collect()
+        })
+    }
+
+    /// Resolve only files listed in this torrent's metadata. A completed
+    /// torrent is checked again here so a stale snapshot cannot trigger
+    /// deletion after its state has changed.
+    fn completion_cleanup_files(&self, id: usize) -> Vec<PathBuf> {
+        if self.cleanup_patterns.is_empty() {
+            return Vec::new();
+        }
+        let Some(handle) = self.get_handle(id) else {
+            return Vec::new();
+        };
+        if !handle.stats().finished {
+            return Vec::new();
+        }
+
+        match handle.with_metadata(|meta| {
+            let relative_paths: Vec<PathBuf> = meta
+                .file_infos
+                .iter()
+                .map(|file| file.relative_filename.clone())
+                .collect();
+            matching_completion_files(
+                handle.output_folder(),
+                &relative_paths,
+                &self.cleanup_patterns,
+            )
+        }) {
+            Ok(files) => files,
+            Err(error) => {
+                tracing::warn!(
+                    "completion cleanup could not read metadata for torrent {}: {}",
+                    id,
+                    error
+                );
+                Vec::new()
+            }
+        }
+    }
+
     /// Escape hatch to the raw session, for the few operations this wrapper
     /// deliberately does not mirror: `update_only_files`, `watch_folder`, and
     /// handing the session to librqbit's `Api` for the read-only HTTP server.
@@ -2533,6 +2587,159 @@ async fn report_op_error(
         .await;
 }
 
+#[derive(Debug, Default)]
+struct CompletionCleanupOutcome {
+    removed: Vec<PathBuf>,
+    errors: Vec<String>,
+}
+
+#[derive(Default)]
+struct CompletionTracking {
+    notifications: HashSet<usize>,
+    cleanup: HashSet<usize>,
+}
+
+/// Match a basename against a small glob syntax (`*` and `?`) without
+/// distinguishing letter case. Patterns deliberately do not need a regex
+/// engine or support path traversal; matching is only against file names.
+fn filename_matches_glob(pattern: &str, filename: &str) -> bool {
+    let pattern: Vec<char> = pattern.to_lowercase().chars().collect();
+    let filename: Vec<char> = filename.to_lowercase().chars().collect();
+    let (mut pattern_index, mut filename_index) = (0, 0);
+    let mut last_star = None;
+    let mut star_match_index = 0;
+
+    while filename_index < filename.len() {
+        if pattern_index < pattern.len()
+            && (pattern[pattern_index] == '?' || pattern[pattern_index] == filename[filename_index])
+        {
+            pattern_index += 1;
+            filename_index += 1;
+        } else if pattern_index < pattern.len() && pattern[pattern_index] == '*' {
+            last_star = Some(pattern_index);
+            pattern_index += 1;
+            star_match_index = filename_index;
+        } else if let Some(star_index) = last_star {
+            pattern_index = star_index + 1;
+            star_match_index += 1;
+            filename_index = star_match_index;
+        } else {
+            return false;
+        }
+    }
+
+    while pattern_index < pattern.len() && pattern[pattern_index] == '*' {
+        pattern_index += 1;
+    }
+    pattern_index == pattern.len()
+}
+
+/// Select existing regular files from this torrent's metadata, without
+/// following symlinks or allowing a path to escape its output folder.
+fn matching_completion_files(
+    output_folder: &Path,
+    relative_paths: &[PathBuf],
+    patterns: &[String],
+) -> Vec<PathBuf> {
+    if patterns.is_empty() {
+        return Vec::new();
+    }
+    let Ok(root) = output_folder.canonicalize() else {
+        return Vec::new();
+    };
+
+    relative_paths
+        .iter()
+        .filter_map(|relative| {
+            validate_torrent_relative_path(relative).ok()?;
+            let filename = relative.file_name()?.to_string_lossy();
+            if !patterns
+                .iter()
+                .any(|pattern| filename_matches_glob(pattern, &filename))
+            {
+                return None;
+            }
+
+            let candidate = output_folder.join(relative);
+            let metadata = std::fs::symlink_metadata(&candidate).ok()?;
+            if !metadata.file_type().is_file() {
+                return None;
+            }
+            let resolved = candidate.canonicalize().ok()?;
+            resolved.starts_with(&root).then_some(resolved)
+        })
+        .collect()
+}
+
+fn remove_completion_files(files: Vec<PathBuf>) -> CompletionCleanupOutcome {
+    let mut outcome = CompletionCleanupOutcome::default();
+    for path in files {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                tracing::info!("completion cleanup removed {:?}", path);
+                outcome.removed.push(path);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::error!("completion cleanup failed for {:?}: {}", path, error);
+                outcome
+                    .errors
+                    .push(format!("{}: {}", path.display(), error));
+            }
+        }
+    }
+    outcome
+}
+
+fn spawn_completion_cleanup(
+    tasks: &mut tokio::task::JoinSet<()>,
+    engine: &TorrentEngine,
+    id: usize,
+    msg_tx: &mpsc::Sender<String>,
+) {
+    while tasks.try_join_next().is_some() {}
+
+    let files = engine.completion_cleanup_files(id);
+    if files.is_empty() {
+        return;
+    }
+    let msg_tx = msg_tx.clone();
+    tasks.spawn(async move {
+        let outcome =
+            match tokio::task::spawn_blocking(move || remove_completion_files(files)).await {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    tracing::error!(
+                        "completion cleanup task failed for torrent {}: {}",
+                        id,
+                        error
+                    );
+                    return;
+                }
+            };
+
+        if !outcome.removed.is_empty() {
+            let message = format!(
+                "Completion cleanup removed {} matching file(s)",
+                outcome.removed.len()
+            );
+            if let Err(error) = msg_tx.send(message).await {
+                tracing::warn!("completion cleanup notification dropped: {}", error);
+            }
+        }
+        if !outcome.errors.is_empty() {
+            let message = format!(
+                "Completion cleanup failed for {} file(s): {}",
+                outcome.errors.len(),
+                outcome.errors[0]
+            );
+            if let Err(error) = msg_tx.send(message).await {
+                tracing::warn!("completion cleanup error notification dropped: {}", error);
+            }
+        }
+    });
+}
+
 /// Spawn a background task that deletes the watch-folder files which fed the
 /// torrents identified by `hashes`, and reap any previously finished ones off
 /// `tasks`. Returns immediately — the deletion has not happened yet. A silent
@@ -2799,7 +3006,7 @@ pub async fn run_engine(
     let enable_notifications = config.ui.enable_notifications;
     let mut cmd_rx = cmd_rx;
 
-    let mut finished_set: HashSet<usize> = HashSet::new();
+    let mut completion_tracking = CompletionTracking::default();
     // Adds run in their own task now, so the one piece of loop state they need
     // to touch — the set that suppresses duplicate completion notices — comes
     // back over a channel instead of being mutated across the task boundary.
@@ -2822,18 +3029,34 @@ pub async fn run_engine(
         engine: &TorrentEngine,
         state_tx: &mpsc::Sender<Vec<TorrentInfo>>,
         msg_tx: &mpsc::Sender<String>,
-        finished_set: &mut HashSet<usize>,
+        completion_tracking: &mut CompletionTracking,
+        cleanup_tasks: &mut tokio::task::JoinSet<()>,
         enable_notifications: bool,
         detail_id: Option<usize>,
     ) {
         let torrents = engine.get_all_torrents(detail_id);
 
         let current_ids: HashSet<usize> = torrents.iter().map(|t| t.id).collect();
-        finished_set.retain(|id| current_ids.contains(id));
+        completion_tracking
+            .notifications
+            .retain(|id| current_ids.contains(id));
+        completion_tracking
+            .cleanup
+            .retain(|id| current_ids.contains(id));
+        let completed_ids = if engine.completion_cleanup_enabled() {
+            engine.finished_torrent_ids()
+        } else {
+            HashSet::new()
+        };
 
         for t in &torrents {
-            if matches!(t.status, TorrentStatus::Seeding) && !finished_set.contains(&t.id) {
-                finished_set.insert(t.id);
+            if completed_ids.contains(&t.id) && completion_tracking.cleanup.insert(t.id) {
+                spawn_completion_cleanup(cleanup_tasks, engine, t.id, msg_tx);
+            }
+            if matches!(t.status, TorrentStatus::Seeding)
+                && !completion_tracking.notifications.contains(&t.id)
+            {
+                completion_tracking.notifications.insert(t.id);
                 // Advisory; not worth blocking the engine for.
                 let _ = msg_tx.try_send(format!("\u{2713} \"{}\" complete", t.name));
 
@@ -3008,7 +3231,8 @@ pub async fn run_engine(
                                 );
                             }
                         }
-                        finished_set.remove(&id);
+                        completion_tracking.notifications.remove(&id);
+                        completion_tracking.cleanup.remove(&id);
                     }
                     Some(EngineCommand::PauseMany(ids)) => {
                         // One snapshot, then O(1) lookups. `get_handle` is a
@@ -3061,7 +3285,8 @@ pub async fn run_engine(
                                     deleted_hashes.insert(hash.as_string());
                                 }
                             }
-                            finished_set.remove(&id);
+                            completion_tracking.notifications.remove(&id);
+                            completion_tracking.cleanup.remove(&id);
                         }
                         // One cleanup pass and one failure message for the
                         // whole batch — see `spawn_watch_cleanup` on why the
@@ -3174,13 +3399,31 @@ pub async fn run_engine(
                         break;
                     }
                 }
-                push_state(&engine, &state_tx, &msg_tx, &mut finished_set, enable_notifications, detail_torrent_id).await;
+                push_state(
+                    &engine,
+                    &state_tx,
+                    &msg_tx,
+                    &mut completion_tracking,
+                    &mut cleanup_tasks,
+                    enable_notifications,
+                    detail_torrent_id,
+                )
+                .await;
             }
             Some(id) = finished_rx.recv() => {
-                finished_set.insert(id);
+                completion_tracking.notifications.insert(id);
             }
             _ = state_tick.tick() => {
-                push_state(&engine, &state_tx, &msg_tx, &mut finished_set, enable_notifications, detail_torrent_id).await;
+                push_state(
+                    &engine,
+                    &state_tx,
+                    &msg_tx,
+                    &mut completion_tracking,
+                    &mut cleanup_tasks,
+                    enable_notifications,
+                    detail_torrent_id,
+                )
+                .await;
                 ticks_since_network_push += 1;
                 if ticks_since_network_push >= NETWORK_PUSH_EVERY_TICKS {
                     ticks_since_network_push = 0;
@@ -3263,6 +3506,95 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn filename_globs_match_case_insensitively() {
+        assert!(filename_matches_glob(
+            "*downloaded*.txt",
+            "Already-DOWNLOADED.txt"
+        ));
+        assert!(filename_matches_glob("?.NFO", "A.nfo"));
+        assert!(!filename_matches_glob("*.nfo", "readme.txt"));
+        assert!(!filename_matches_glob("?.nfo", "two.nfo"));
+    }
+
+    #[test]
+    fn completion_cleanup_removes_only_matching_torrent_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("release");
+        std::fs::create_dir_all(&nested).unwrap();
+        let matched = [
+            nested.join("Already-DOWNLOADED.txt"),
+            nested.join("INFO.NFO"),
+            nested.join("link.URL"),
+        ];
+        let untouched = nested.join("video.mkv");
+        for path in matched.iter().chain(std::iter::once(&untouched)) {
+            std::fs::write(path, b"payload").unwrap();
+        }
+
+        let relative_paths = [
+            PathBuf::from("release/Already-DOWNLOADED.txt"),
+            PathBuf::from("release/INFO.NFO"),
+            PathBuf::from("release/link.URL"),
+            PathBuf::from("release/video.mkv"),
+        ];
+        let patterns = vec![
+            "*downloaded*.txt".to_string(),
+            "*.nfo".to_string(),
+            "*.url".to_string(),
+        ];
+        let files = matching_completion_files(dir.path(), &relative_paths, &patterns);
+        let outcome = remove_completion_files(files);
+
+        assert_eq!(outcome.removed.len(), 3);
+        assert!(outcome.errors.is_empty());
+        assert!(matched.iter().all(|path| !path.exists()));
+        assert!(untouched.exists());
+    }
+
+    #[test]
+    fn completion_cleanup_does_nothing_without_patterns() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("remove.nfo");
+        std::fs::write(&file, b"payload").unwrap();
+
+        let files = matching_completion_files(dir.path(), &[PathBuf::from("remove.nfo")], &[]);
+
+        assert!(files.is_empty());
+        assert!(file.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completion_cleanup_skips_symlinks_and_paths_outside_the_torrent() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("payload");
+        std::fs::create_dir_all(&output).unwrap();
+        let outside = dir.path().join("outside.nfo");
+        std::fs::write(&outside, b"keep").unwrap();
+        std::os::unix::fs::symlink(&outside, output.join("linked.nfo")).unwrap();
+        std::fs::write(output.join("regular.nfo"), b"remove").unwrap();
+
+        let files = matching_completion_files(
+            &output,
+            &[
+                PathBuf::from("linked.nfo"),
+                PathBuf::from("regular.nfo"),
+                PathBuf::from("../outside.nfo"),
+            ],
+            &["*.nfo".to_string()],
+        );
+
+        assert_eq!(
+            files,
+            vec![output.join("regular.nfo").canonicalize().unwrap()]
+        );
+        let outcome = remove_completion_files(files);
+        assert_eq!(outcome.removed.len(), 1);
+        assert!(outside.exists());
+        assert!(output.join("linked.nfo").exists());
+    }
 
     #[test]
     fn strip_udp_trackers_drops_udp_and_keeps_the_rest_verbatim() {
@@ -3854,10 +4186,43 @@ mod tests {
             pending_adds: std::sync::Mutex::new(std::collections::HashMap::new()),
             next_pending_ticket: std::sync::atomic::AtomicU64::new(0),
             download_dir: downloads.to_path_buf(),
+            cleanup_patterns: Vec::new(),
             preview_tasks: std::sync::Mutex::new(std::collections::HashMap::new()),
             failed_adds: std::sync::atomic::AtomicU64::new(0),
             mutation_lock: tokio::sync::Mutex::new(()),
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn completion_cleanup_does_not_remove_files_before_torrent_finishes() {
+        const NAME: &str = "pending.nfo";
+        let dir = tempfile::tempdir().unwrap();
+        let downloads = dir.path().join("downloads");
+        std::fs::create_dir_all(&downloads).unwrap();
+        let mut engine = test_engine(&downloads, &dir.path().join("session")).await;
+        engine.cleanup_patterns = vec!["*.nfo".to_string()];
+        let response = engine
+            .session()
+            .add_torrent(
+                super::AddTorrent::from_bytes(single_file_torrent(NAME, 1)),
+                Some(super::AddTorrentOptions {
+                    overwrite: true,
+                    paused: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        let (id, handle, _) = super::added_handle(response).unwrap();
+        handle.wait_until_initialized().await.unwrap();
+
+        let matching_file = downloads.join(NAME);
+        std::fs::write(&matching_file, b"x").unwrap();
+        assert!(!handle.stats().finished);
+        assert!(engine.completion_cleanup_files(id).is_empty());
+        assert!(matching_file.exists());
+
+        engine.session().stop().await;
     }
 
     #[test]

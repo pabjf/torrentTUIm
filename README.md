@@ -435,6 +435,8 @@ Config file is created automatically at:
 download_dir = "~/Downloads/torrents"
 confirm_on_quit = true
 # watch_dir = "~/torrents/watch"  # optional; auto-add .torrent files dropped here
+cleanup_patterns = []          # optional, case-insensitive filename globs removed at 100%
+# cleanup_patterns = ["*downloaded*.txt", "*.nfo", "*.url"]
 
 [network]
 listen_port = 6881
@@ -473,6 +475,12 @@ bind_interface = ""           # bind all BitTorrent traffic to an interface, e.g
 ```
 
 Paths (`download_dir`, `watch_dir`, `player.command`) may start with `~/`, which expands to your home directory.
+
+`general.cleanup_patterns` is an optional array of filename globs. Matching files
+from a torrent's own file list are removed only after librqbit reports that
+torrent complete; files that do not match are left alone. Matching ignores
+letter case. Use `*` for any number of characters and `?` for one character
+(these are glob patterns, not full regular expressions).
 
 The `[privacy]` keys are all off by default and opt-in. See [Privacy](#privacy) for exactly what each one does and its caveats, or jump to the copy-paste [recipes](#recipes).
 
